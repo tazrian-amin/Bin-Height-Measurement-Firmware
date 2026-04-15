@@ -2,6 +2,9 @@
 #include <Notecard.h>
 
 int getSensorInterval();
+float getRandomHeight();
+String getCurrentTimestamp();
+String buildHeightJSON(float height, String timestamp);
 
 #define usbSerial Serial
 #define productUID "com.gmail.amin.tazrian1979:bin_height_measurement_firmware"
@@ -84,14 +87,14 @@ int getSensorInterval()
 // Generate random height in range 0-1000 cm
 float getRandomHeight()
 {
-  return random(0, 100001) / 100.0;  // Returns value between 0.00 and 1000.00
+  return random(0, 100001) / 100.0; // Returns value between 0.00 and 1000.00
 }
 
 // Get current timestamp from Notecard's time service
 // Returns ISO-8601 formatted string (e.g., "2026-04-15T10:30:00Z")
 String getCurrentTimestamp()
 {
-  String timestamp = "1970-01-01T00:00:00Z";  // Fallback value
+  String timestamp = "1970-01-01T00:00:00Z"; // Fallback value
   J *req = notecard.newRequest("time.status");
   if (req != NULL)
   {
@@ -115,7 +118,7 @@ String buildHeightJSON(float height, String timestamp)
 {
   // Format: {"height": 123.45, "timestamp": "2026-04-15T10:30:00Z"}
   String json = "{\"height\": ";
-  json += String(height, 2);  // 2 decimal places
+  json += String(height, 2); // 2 decimal places
   json += ", \"timestamp\": \"";
   json += timestamp;
   json += "\"}";
