@@ -42,5 +42,21 @@ void loop()
   usbSerial.print(humidity);
   usbSerial.println(" %");
 
+  {
+    J *req = notecard.newRequest("note.add");
+    if (req != NULL)
+    {
+      JAddStringToObject(req, "file", "sensors.qo");
+      JAddBoolToObject(req, "sync", true);
+      J *body = JAddObjectToObject(req, "body");
+      if (body)
+      {
+        JAddNumberToObject(body, "temp", temperature);
+        JAddNumberToObject(body, "humidity", humidity);
+      }
+      notecard.sendRequest(req);
+    }
+  }
+
   delay(15000);
 }
