@@ -1,20 +1,16 @@
 #include <Arduino.h>
 #include <Notecard.h>
-#include <NotecardPseudoSensor.h>
 
 int getSensorInterval();
-
-using namespace blues;
 
 #define usbSerial Serial
 #define productUID "com.gmail.amin.tazrian1979:bin_height_measurement_firmware"
 
 Notecard notecard;
-NotecardPseudoSensor sensor(notecard);
 
 void setup()
 {
-  // put your setup code here, to run once:
+  // This setup code run once:
   delay(2500);
   usbSerial.begin(115200);
 
@@ -34,17 +30,15 @@ void setup()
 
 void loop()
 {
-  // put your main code here, to run repeatedly:
-  float temperature = sensor.temp();
-  float humidity = sensor.humidity();
+  // This main code runs repeatedly:
+  float height = getRandomHeight();
+  String timestamp = getCurrentTimestamp();
 
-  usbSerial.print("Temperature = ");
-  usbSerial.print(temperature);
-  usbSerial.println(" *C");
-  usbSerial.print("Humidity = ");
-  usbSerial.print(humidity);
-  usbSerial.println(" %");
+  // Send height data to Android app via USB-Serial as JSON
+  String jsonOutput = buildHeightJSON(height, timestamp);
+  usbSerial.println(jsonOutput);
 
+  // Send height data to Notecard for cloud synchronization
   {
     J *req = notecard.newRequest("note.add");
     if (req != NULL)
@@ -54,8 +48,7 @@ void loop()
       J *body = JAddObjectToObject(req, "body");
       if (body)
       {
-        JAddNumberToObject(body, "temp", temperature);
-        JAddNumberToObject(body, "humidity", humidity);
+        JAddNumberToObject(body, "height", height);
       }
       notecard.sendRequest(req);
     }
@@ -87,4 +80,44 @@ int getSensorInterval()
     notecard.deleteResponse(rsp);
   }
   return sensorIntervalSeconds;
+}
+// Generate random height in range 0-1000 cm
+float getRandomHeight()
+{
+  return random(0, 100001) / 100.0;  // Returns value between 0.00 and 1000.00
+}
+
+// Get current timestamp from Notecard's time service
+// Returns ISO-8601 formatted string (e.g., "2026-04-15T10:30:00Z")
+String getCurrentTimestamp()
+{
+  String timestamp = "1970-01-01T00:00:00Z";  // Fallback value
+  J *req = notecard.newRequest("time.status");
+  if (req != NULL)
+  {
+    J *rsp = notecard.requestAndResponse(req);
+    if (rsp != NULL)
+    {
+      // Extract ISO-8601 formatted timestamp from response
+      const char *isoStr = JGetString(rsp, "iso8601");
+      if (isoStr != NULL && isoStr[0] != '\0')
+      {
+        timestamp = String(isoStr);
+      }
+      notecard.deleteResponse(rsp);
+    }
+  }
+  return timestamp;
+}
+
+// Build JSON string with height and timestamp for Android app
+String buildHeightJSON(float height, String timestamp)
+{
+  // Format: {"height": 123.45, "timestamp": "2026-04-15T10:30:00Z"}
+  String json = "{\"height\": ";
+  json += String(height, 2);  // 2 decimal places
+  json += ", \"timestamp\": \"";
+  json += timestamp;
+  json += "\"}";
+  return json;
 }
