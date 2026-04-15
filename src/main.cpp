@@ -16,6 +16,13 @@ void setup()
   // This setup code run once:
   delay(2500);
   usbSerial.begin(115200);
+  delay(500);
+
+  // Print connection status
+  usbSerial.println("\n==================================");
+  usbSerial.println("USB Serial Connected - System Ready");
+  usbSerial.println("Bin Height Measurement Firmware");
+  usbSerial.println("==================================");
 
   notecard.begin();
   {
@@ -28,6 +35,9 @@ void setup()
       notecard.sendRequest(req);
     }
   }
+
+  usbSerial.println("Listening for connections...");
+  usbSerial.println("");
 }
 
 void loop()
@@ -38,7 +48,7 @@ void loop()
 
   // Send height data to Android app via USB-Serial as JSON
   String jsonOutput = buildHeightJSON(height, timestamp);
-  usbSerial.println(jsonOutput);
+  usbSerial.println("[DATA] " + jsonOutput);
 
   // Send height data to Notecard for cloud synchronization
   {
@@ -57,9 +67,9 @@ void loop()
   }
 
   int sensorIntervalSeconds = getSensorInterval();
-  usbSerial.print("Delaying ");
+  usbSerial.print("[INFO] Waiting ");
   usbSerial.print(sensorIntervalSeconds);
-  usbSerial.println(" seconds");
+  usbSerial.println(" seconds...");
   delay(sensorIntervalSeconds * 1000);
 }
 
