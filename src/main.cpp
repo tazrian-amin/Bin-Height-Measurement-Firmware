@@ -2,6 +2,8 @@
 #include <Notecard.h>
 #include <NotecardPseudoSensor.h>
 
+int getSensorInterval();
+
 using namespace blues;
 
 #define usbSerial Serial
@@ -24,6 +26,7 @@ void setup()
     {
       JAddStringToObject(req, "product", productUID);
       JAddStringToObject(req, "mode", "continuous");
+      JAddNumberToObject(req, "inbound", 5);
       notecard.sendRequest(req);
     }
   }
@@ -58,5 +61,30 @@ void loop()
     }
   }
 
-  delay(15000);
+  int sensorIntervalSeconds = getSensorInterval();
+  usbSerial.print("Delaying ");
+  usbSerial.print(sensorIntervalSeconds);
+  usbSerial.println(" seconds");
+  delay(sensorIntervalSeconds * 1000);
+}
+
+// This function assumes you’ll set the reading_interval environment variable to
+// a positive integer. If the variable is not set, set to 0, or set to an invalid
+// type, this function returns a default value of 60.
+int getSensorInterval()
+{
+  int sensorIntervalSeconds = 60;
+  J *req = notecard.newRequest("env.get");
+  if (req != NULL)
+  {
+    JAddStringToObject(req, "name", "reading_interval");
+    J *rsp = notecard.requestAndResponse(req);
+    int readingIntervalEnvVar = atoi(JGetString(rsp, "text"));
+    if (readingIntervalEnvVar > 0)
+    {
+      sensorIntervalSeconds = readingIntervalEnvVar;
+    }
+    notecard.deleteResponse(rsp);
+  }
+  return sensorIntervalSeconds;
 }
