@@ -18,7 +18,6 @@ void setup()
   usbSerial.begin(115200);
 
   notecard.begin();
-  notecard.setDebugOutputStream(usbSerial);
   {
     J *req = notecard.newRequest("hub.set");
     if (req != NULL)
@@ -90,26 +89,12 @@ float getRandomHeight()
   return random(0, 100001) / 100.0; // Returns value between 0.00 and 1000.00
 }
 
-// Get current timestamp from Notecard's time service
-// Returns ISO-8601 formatted string (e.g., "2026-04-15T10:30:00Z")
+// Get current timestamp placeholder using boot time.
+// Notecard time.status is unsupported on this firmware, so we use elapsed milliseconds.
 String getCurrentTimestamp()
 {
-  String timestamp = "1970-01-01T00:00:00Z"; // Fallback value
-  J *req = notecard.newRequest("time.status");
-  if (req != NULL)
-  {
-    J *rsp = notecard.requestAndResponse(req);
-    if (rsp != NULL)
-    {
-      // Extract ISO-8601 formatted timestamp from response
-      const char *isoStr = JGetString(rsp, "iso8601");
-      if (isoStr != NULL && isoStr[0] != '\0')
-      {
-        timestamp = String(isoStr);
-      }
-      notecard.deleteResponse(rsp);
-    }
-  }
+  unsigned long ms = millis();
+  String timestamp = String(ms);
   return timestamp;
 }
 
