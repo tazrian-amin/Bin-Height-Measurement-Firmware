@@ -1,121 +1,147 @@
 #include <Arduino.h>
-#include <Notecard.h>
 
-int getSensorInterval();
-float getRandomHeight();
-String getCurrentTimestamp();
-String buildHeightJSON(float height, String timestamp);
+// Printf Definition
+#define PRINT_FUNCTION 1 // 1 to Turn Printf On & 0 to turn off
 
-#define usbSerial Serial
-#define productUID "com.gmail.amin.tazrian1979:bin_height_measurement_firmware"
+// Macros for debug printing
+#if PRINT_FUNCTION
+  #define DEBUG_PRINT(x)    Serial.print(x)
+  #define DEBUG_PRINTLN(x)  Serial.println(x)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+#endif
 
-Notecard notecard;
+// ===================================================================
+//  Serial Definitions
+// ===================================================================
+// 1. Notecard Serial (Standard Serial1)
+#define notecardSerial Serial1
 
-void setup()
-{
-  // This setup code run once:
-  delay(2500);
-  usbSerial.begin(115200);
-  delay(500);
+// 2. External android Serial (Serial2)
+//    RX Pin = A0 (Receives data from the android's TX pin)
+//    TX Pin = A3 (Transmits data to the android's RX pin)
+HardwareSerial Serial2(A0, A3);
+#define androidSerial Serial2
 
-  // Print connection status
-  usbSerial.println("\n==================================");
-  usbSerial.println("USB Serial Connected - System Ready");
-  usbSerial.println("Bin Height Measurement Firmware");
-  usbSerial.println("==================================");
+// Pin Definitions
+#define ANALOG_INPUT_PIN PA1 // Pin for android analogue voltage reading
+#define ATTN_PIN D5 
 
-  notecard.begin();
-  {
-    J *req = notecard.newRequest("hub.set");
-    if (req != NULL)
-    {
-      JAddStringToObject(req, "product", productUID);
-      JAddStringToObject(req, "mode", "continuous");
-      JAddNumberToObject(req, "inbound", 5);
-      notecard.sendRequest(req);
+// Notecard Variables
+#define PRODUCT_UID "com.gmail.amin.tazrian1979:binheightv2" // <<<<<<<<<<<<<<<<< CHANGE ACCORDINGLY
+#define INBOUND_NOTEFILE "data.qi"
+
+// Timing variables
+unsigned long previousPrintMillis = 0;
+
+// ===================================================================
+//  SETUP
+// ===================================================================
+void setup() {
+    Serial.begin(9600);           // USB Debugging
+    notecardSerial.begin(9600);   // Notecard Communication
+    androidSerial.begin(9600);     // External UART android Communication
+
+    // Timeouts to prevent blocking forever
+    notecardSerial.setTimeout(5000);
+    androidSerial.setTimeout(1000);
+
+    pinMode(ANALOG_INPUT_PIN, INPUT_ANALOG);
+    analogReadResolution(12);
+    pinMode(ATTN_PIN, INPUT);
+
+    delay(3000);
+
+    // Configure Notecard with the constant ProductUID
+    notecardSerial.println("{\"req\":\"hub.set\",\"product\":\"" PRODUCT_UID "\"}");
+    delay(1000);
+    notecardSerial.println("{\"req\":\"hub.set\",\"mode\":\"continuous\",\"sync\":true}");
+    delay(3000);
+    
+    DEBUG_PRINT("Notecard configured for ProductUID: ");
+    DEBUG_PRINTLN(PRODUCT_UID);
+    delay(5000);
+    notecardSerial.println("{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"data.qi\"]}");
+
+    DEBUG_PRINT("===Starting main loop===\n");
+    delay(3000);
+}
+
+// ===================================================================
+//  MAIN LOOP
+// ===================================================================
+void loop() {
+    // Track time for non-blocking functions
+    unsigned long currentMillis = millis();
+
+    // ---------------------------------------------------------------
+    // 1. Check for inbound commands from Notecard via ATTN pin
+    // ---------------------------------------------------------------
+    if (digitalRead(ATTN_PIN) == HIGH) {
+        DEBUG_PRINTLN("\n-- ATTN is HIGH! Event detected");
+        DEBUG_PRINTLN("-- Polling for Notes --");
+        
+        // Step 1: Sync with Notehub
+        notecardSerial.println("{\"req\":\"hub.sync\"}");
+        notecardSerial.readStringUntil('\n'); // Clear the immediate {} response
+        delay(5000); // Wait for sync to complete
+
+        // Flush any old data from the serial buffer before making a new request
+        while(notecardSerial.available()) {
+          notecardSerial.read();
+        }
+
+        // Step 2: Get the note and delete it
+        char getNoteCmd[300];
+        snprintf(getNoteCmd, sizeof(getNoteCmd), "{\"req\":\"note.get\",\"file\":\"%s\",\"delete\":true}", INBOUND_NOTEFILE);
+        notecardSerial.println(getNoteCmd);
+
+        // Read the actual note content
+        String noteContent = notecardSerial.readStringUntil('\n');
+        DEBUG_PRINT(">> Note Received: ");
+        DEBUG_PRINTLN(noteContent);
+
+        // CRITICAL STEP: Re-arm the ATTN pin for the next event.
+        DEBUG_PRINTLN("Re-arming ATTN pin...");
+        notecardSerial.println("{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"data.qi\"]}");
+        notecardSerial.readStringUntil('\n'); // Clear the response
+        delay(3000);
     }
-  }
 
-  usbSerial.println("Listening for connections...");
-  usbSerial.println("");
-}
-
-void loop()
-{
-  // This main code runs repeatedly:
-  float height = getRandomHeight();
-  String timestamp = getCurrentTimestamp();
-
-  // Send height data to Android app via USB-Serial as JSON
-  String jsonOutput = buildHeightJSON(height, timestamp);
-  usbSerial.println("[DATA] " + jsonOutput);
-
-  // Send height data to Notecard for cloud synchronization
-  {
-    J *req = notecard.newRequest("note.add");
-    if (req != NULL)
-    {
-      JAddStringToObject(req, "file", "sensors.qo");
-      JAddBoolToObject(req, "sync", true);
-      J *body = JAddObjectToObject(req, "body");
-      if (body)
-      {
-        JAddNumberToObject(body, "height", height);
-      }
-      notecard.sendRequest(req);
+    // ---------------------------------------------------------------
+    // 2. Read incoming data from the External UART android
+    // ---------------------------------------------------------------
+    if (androidSerial.available()) {
+        String androidData = androidSerial.readStringUntil('\n');
+        
+        // Clean up the string (optional, removes trailing \r)
+        androidData.trim(); 
+        
+        if (androidData.length() > 0) {
+            DEBUG_PRINT(">> Android UART Data: ");
+            DEBUG_PRINTLN(androidData);
+        }
     }
-  }
 
-  int sensorIntervalSeconds = getSensorInterval();
-  usbSerial.print("[INFO] Waiting ");
-  usbSerial.print(sensorIntervalSeconds);
-  usbSerial.println(" seconds...");
-  delay(sensorIntervalSeconds * 1000);
-}
+    // ---------------------------------------------------------------
+    // 3. Formatted print statement with a 5s delay
+    // ---------------------------------------------------------------
+    if (currentMillis - previousPrintMillis >= 5000) {
+        previousPrintMillis = currentMillis;
+        
+        int rawA1 = analogRead(ANALOG_INPUT_PIN);
+        DEBUG_PRINT("Raw A1: ");
+        DEBUG_PRINTLN(rawA1);
 
-// This function assumes you’ll set the reading_interval environment variable to
-// a positive integer. If the variable is not set, set to 0, or set to an invalid
-// type, this function returns a default value of 60.
-int getSensorInterval()
-{
-  int sensorIntervalSeconds = 60;
-  J *req = notecard.newRequest("env.get");
-  if (req != NULL)
-  {
-    JAddStringToObject(req, "name", "reading_interval");
-    J *rsp = notecard.requestAndResponse(req);
-    int readingIntervalEnvVar = atoi(JGetString(rsp, "text"));
-    if (readingIntervalEnvVar > 0)
-    {
-      sensorIntervalSeconds = readingIntervalEnvVar;
+        DEBUG_PRINTLN("Sending ADC value to Android");
+        androidSerial.print("ADC value:");
+        androidSerial.print(rawA1);
+
+        // Send ADC value to Notehub via Notecard
+        char addNoteCmd[200];
+        snprintf(addNoteCmd, sizeof(addNoteCmd), "{\"req\":\"note.add\",\"file\":\"data.qi\",\"body\":{\"adc\":%d}}", rawA1);
+        notecardSerial.println(addNoteCmd);
+        DEBUG_PRINTLN("ADC value sent to Notehub");
     }
-    notecard.deleteResponse(rsp);
-  }
-  return sensorIntervalSeconds;
-}
-// Generate random height in range 0-1000 cm
-float getRandomHeight()
-{
-  return random(0, 100001) / 100.0; // Returns value between 0.00 and 1000.00
-}
-
-// Get current timestamp placeholder using boot time.
-// Notecard time.status is unsupported on this firmware, so we use elapsed milliseconds.
-String getCurrentTimestamp()
-{
-  unsigned long ms = millis();
-  String timestamp = String(ms);
-  return timestamp;
-}
-
-// Build JSON string with height and timestamp for Android app
-String buildHeightJSON(float height, String timestamp)
-{
-  // Format: {"height": 123.45, "timestamp": "2026-04-15T10:30:00Z"}
-  String json = "{\"height\": ";
-  json += String(height, 2); // 2 decimal places
-  json += ", \"timestamp\": \"";
-  json += timestamp;
-  json += "\"}";
-  return json;
 }
