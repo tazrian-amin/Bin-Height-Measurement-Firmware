@@ -1,147 +1,301 @@
 #include <Arduino.h>
 
-// Printf Definition
-#define PRINT_FUNCTION 1 // 1 to Turn Printf On & 0 to turn off
+/*
+  ===========================
+  Name ↔ Hardware cheat sheet
+  ===========================
 
-// Macros for debug printing
-#if PRINT_FUNCTION
-  #define DEBUG_PRINT(x)    Serial.print(x)
-  #define DEBUG_PRINTLN(x)  Serial.println(x)
-#else
-  #define DEBUG_PRINT(x)
-  #define DEBUG_PRINTLN(x)
-#endif
+  WIRED to Android (USB):
+    - Code name: `Serial`
+    - Physical: Swan micro-USB port (CDC/USB serial)
 
-// ===================================================================
-//  Serial Definitions
-// ===================================================================
-// 1. Notecard Serial (Standard Serial1)
-#define notecardSerial Serial1
+  Notecard (UART on Notecarrier-F):
+    - Code name: `notecardUart` (alias of `Serial1`)
+    - Physical wiring you described:
+        F_TX -> N_RX
+        F_RX -> N_TX
+        F_D5 -> N_ATTN   (ATTN interrupt)
 
-// 2. External android Serial (Serial2)
-//    RX Pin = A0 (Receives data from the android's TX pin)
-//    TX Pin = A3 (Transmits data to the android's RX pin)
-HardwareSerial Serial2(A0, A3);
-#define androidSerial Serial2
+  HM-10 BLE UART (wireless to Android):
+    - Code name: `bleUart` (UART on pins A0/A3)
+    - Notecarrier-F silkscreen pins:
+        F_A0 = MCU RX  <- HM-10 TXD
+        F_A3 = MCU TX  -> HM-10 RXD
+        3V3            -> HM-10 VCC
+        GND            -> HM-10 GND
 
-// Pin Definitions
-#define ANALOG_INPUT_PIN PA1 // Pin for android analogue voltage reading
-#define ATTN_PIN D5 
+  Important:
+    - Do NOT connect a USB-Serial adapter to F_A0/F_A3 at the same time as the HM-10.
+      Wired mode should use the Swan micro-USB (`Serial`), while wireless uses HM-10 (`bleUart`).
+*/
 
-// Notecard Variables
-#define PRODUCT_UID "com.gmail.amin.tazrian1979:binheightv2" // <<<<<<<<<<<<<<<<< CHANGE ACCORDINGLY
-#define INBOUND_NOTEFILE "data.qi"
+namespace {
 
-// Timing variables
-unsigned long previousPrintMillis = 0;
+// ----------------------------
+// Debug logging
+// ----------------------------
+constexpr bool kDebugLogEnabled = true;
+
+template <typename T>
+inline void dbgPrint(const T& v) {
+  if (kDebugLogEnabled) {
+    Serial.print(v);
+  }
+}
+
+template <typename T>
+inline void dbgPrintln(const T& v) {
+  if (kDebugLogEnabled) {
+    Serial.println(v);
+  }
+}
+
+inline void dbgPrintln() {
+  if (kDebugLogEnabled) {
+    Serial.println();
+  }
+}
+
+HardwareSerial& notecardUart = Serial1;
+constexpr uint8_t kNotecardAttnPin = D5; // F_D5 -> N_ATTN (attention interrupt)
+constexpr uint8_t kBleUartRxPin = A0; // HM-10 TXD -> F_A0 (MCU RX)
+constexpr uint8_t kBleUartTxPin = A3; // HM-10 RXD -> F_A3 (MCU TX)
+HardwareSerial bleUart(kBleUartRxPin, kBleUartTxPin);
+
+// ----------------------------
+// Sensor input
+// ----------------------------
+constexpr uint8_t kAdcPin = PA1;
+
+// ----------------------------
+// Notecard config
+// ----------------------------
+constexpr const char* kProductUid = "com.gmail.amin.tazrian1979:binheightv2";
+constexpr const char* kInboundNotefile = "data.qi";
+
+// ----------------------------
+// Timing
+// ----------------------------
+constexpr unsigned long kSamplePeriodMs = 5000; // 5 seconds between ADC samples
+const unsigned long kSyncTimeoutMs = 5000; // 5 seconds max to wait for Notecard sync response after ATTN
+const unsigned long kNotecardResponseTimeoutMs = 5000; // 5 seconds max to wait for any Notecard response (e.g., product config, note add, etc.)
+const unsigned long kAdcAverageSamples = 10; // Number of ADC samples to average for each reported value
+
+unsigned long lastSampleMs = 0; // Timestamp of last ADC sample sent
+unsigned long syncStartMs = 0; // Timestamp when Notecard sync was initiated (after ATTN)
+bool isSyncing = false; // True if we're currently waiting for Notecard sync response after ATTN interrupt
+bool attnTriggered = false; // Set to true in ATTN interrupt handler, indicating we should poll for note in main loop
+
+void onAttnInterrupt() {
+  attnTriggered = true;
+}
+
+bool readNotecardResponse(char* buffer, size_t bufferSize, unsigned long timeoutMs) {
+  unsigned long startTime = millis();
+  size_t bytesRead = 0;
+  
+  while (millis() - startTime < timeoutMs) {
+    if (notecardUart.available()) {
+      char c = notecardUart.read();
+      if (bytesRead < bufferSize - 1) {
+        buffer[bytesRead++] = c;
+      }
+      if (c == '\n') {
+        buffer[bytesRead] = '\0';
+        return true;
+      }
+    }
+  }
+  buffer[bytesRead] = '\0';
+  return false;
+}
+
+bool isValidNotecardResponse(const char* response) {
+  return response != nullptr && strlen(response) > 2 && strstr(response, "err") == nullptr;
+}
+
+void armNotecardAttn() {
+  notecardUart.println("{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"data.qi\"]}" );
+  char response[256];
+  readNotecardResponse(response, sizeof(response), 1000);
+  if (isValidNotecardResponse(response)) {
+    dbgPrintln("Notecard ATTN armed successfully");
+  } else {
+    dbgPrint("Warning: ATTN arm response: ");
+    dbgPrintln(response);
+  }
+}
+
+int readAveragedAdc() {
+  long sum = 0;
+  for (uint16_t i = 0; i < kAdcAverageSamples; i++) {
+    sum += analogRead(kAdcPin);
+  }
+  return (int)(sum / kAdcAverageSamples);
+}
+
+} // namespace
 
 // ===================================================================
 //  SETUP
 // ===================================================================
 void setup() {
-    Serial.begin(9600);           // USB Debugging
-    notecardSerial.begin(9600);   // Notecard Communication
-    androidSerial.begin(9600);     // External UART android Communication
+  Serial.begin(9600);        // wired output (USB)
+  notecardUart.begin(9600);  // Notecard (Serial1 via F_TX/F_RX)
+  bleUart.begin(9600);       // HM-10 default baud unless changed via AT commands
 
-    // Timeouts to prevent blocking forever
-    notecardSerial.setTimeout(5000);
-    androidSerial.setTimeout(1000);
+  notecardUart.setTimeout(5000);
+  bleUart.setTimeout(1000);
 
-    pinMode(ANALOG_INPUT_PIN, INPUT_ANALOG);
-    analogReadResolution(12);
-    pinMode(ATTN_PIN, INPUT);
+  pinMode(kAdcPin, INPUT_ANALOG);
+  analogReadResolution(12);
+  pinMode(kNotecardAttnPin, INPUT);
+  attachInterrupt(digitalPinToInterrupt(kNotecardAttnPin), onAttnInterrupt, RISING);
 
-    delay(3000);
+  delay(3000);
 
-    // Configure Notecard with the constant ProductUID
-    notecardSerial.println("{\"req\":\"hub.set\",\"product\":\"" PRODUCT_UID "\"}");
-    delay(1000);
-    notecardSerial.println("{\"req\":\"hub.set\",\"mode\":\"continuous\",\"sync\":true}");
-    delay(3000);
-    
-    DEBUG_PRINT("Notecard configured for ProductUID: ");
-    DEBUG_PRINTLN(PRODUCT_UID);
-    delay(5000);
-    notecardSerial.println("{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"data.qi\"]}");
+  // Configure Notecard
+  char productCmd[256];
+  snprintf(productCmd, sizeof(productCmd), "{\"req\":\"hub.set\",\"product\":\"%s\"}", kProductUid);
+  notecardUart.println(productCmd);
+  
+  char response[256];
+  if (readNotecardResponse(response, sizeof(response), kNotecardResponseTimeoutMs)) {
+    if (isValidNotecardResponse(response)) {
+      dbgPrint("Notecard product set: ");
+      dbgPrintln(response);
+    } else {
+      dbgPrint("Warning: Product config response: ");
+      dbgPrintln(response);
+    }
+  } else {
+    dbgPrintln("Error: Notecard product config timeout");
+  }
+  
+  delay(1000);
+  
+  notecardUart.println("{\"req\":\"hub.set\",\"mode\":\"continuous\",\"sync\":true}");
+  if (readNotecardResponse(response, sizeof(response), kNotecardResponseTimeoutMs)) {
+    if (isValidNotecardResponse(response)) {
+      dbgPrint("Notecard mode set: ");
+      dbgPrintln(response);
+    } else {
+      dbgPrint("Warning: Mode config response: ");
+      dbgPrintln(response);
+    }
+  } else {
+    dbgPrintln("Error: Notecard mode config timeout");
+  }
 
-    DEBUG_PRINT("===Starting main loop===\n");
-    delay(3000);
+  dbgPrint("Notecard configured for ProductUID: ");
+  dbgPrintln(kProductUid);
+  delay(2000);
+
+  armNotecardAttn();
+
+  dbgPrintln("===Starting main loop===");
+  delay(2000);
 }
 
 // ===================================================================
 //  MAIN LOOP
 // ===================================================================
 void loop() {
-    // Track time for non-blocking functions
-    unsigned long currentMillis = millis();
+  const unsigned long nowMs = millis();
 
-    // ---------------------------------------------------------------
-    // 1. Check for inbound commands from Notecard via ATTN pin
-    // ---------------------------------------------------------------
-    if (digitalRead(ATTN_PIN) == HIGH) {
-        DEBUG_PRINTLN("\n-- ATTN is HIGH! Event detected");
-        DEBUG_PRINTLN("-- Polling for Notes --");
-        
-        // Step 1: Sync with Notehub
-        notecardSerial.println("{\"req\":\"hub.sync\"}");
-        notecardSerial.readStringUntil('\n'); // Clear the immediate {} response
-        delay(5000); // Wait for sync to complete
+  // 1) Handle inbound Notecard note notifications (ATTN interrupt triggered).
+  if (attnTriggered && !isSyncing) {
+    attnTriggered = false;
+    isSyncing = true;
+    syncStartMs = nowMs;
+    
+    dbgPrintln();
+    dbgPrintln("-- Notecard ATTN HIGH: polling inbound note --");
 
-        // Flush any old data from the serial buffer before making a new request
-        while(notecardSerial.available()) {
-          notecardSerial.read();
-        }
+    // Initiate sync (non-blocking)
+    notecardUart.println("{\"req\":\"hub.sync\"}");
+  }
 
-        // Step 2: Get the note and delete it
-        char getNoteCmd[300];
-        snprintf(getNoteCmd, sizeof(getNoteCmd), "{\"req\":\"note.get\",\"file\":\"%s\",\"delete\":true}", INBOUND_NOTEFILE);
-        notecardSerial.println(getNoteCmd);
-
-        // Read the actual note content
-        String noteContent = notecardSerial.readStringUntil('\n');
-        DEBUG_PRINT(">> Note Received: ");
-        DEBUG_PRINTLN(noteContent);
-
-        // CRITICAL STEP: Re-arm the ATTN pin for the next event.
-        DEBUG_PRINTLN("Re-arming ATTN pin...");
-        notecardSerial.println("{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"data.qi\"]}");
-        notecardSerial.readStringUntil('\n'); // Clear the response
-        delay(3000);
+  // Handle sync completion with timeout
+  if (isSyncing && (nowMs - syncStartMs >= kSyncTimeoutMs)) {
+    isSyncing = false;
+    
+    // Clear any remaining data
+    while (notecardUart.available()) {
+      notecardUart.read();
     }
 
-    // ---------------------------------------------------------------
-    // 2. Read incoming data from the External UART android
-    // ---------------------------------------------------------------
-    if (androidSerial.available()) {
-        String androidData = androidSerial.readStringUntil('\n');
-        
-        // Clean up the string (optional, removes trailing \r)
-        androidData.trim(); 
-        
-        if (androidData.length() > 0) {
-            DEBUG_PRINT(">> Android UART Data: ");
-            DEBUG_PRINTLN(androidData);
-        }
+    char getNoteCmd[300];
+    snprintf(getNoteCmd, sizeof(getNoteCmd),
+             "{\"req\":\"note.get\",\"file\":\"%s\",\"delete\":true}",
+             kInboundNotefile);
+    notecardUart.println(getNoteCmd);
+
+    char noteContent[512];
+    if (readNotecardResponse(noteContent, sizeof(noteContent), 2000)) {
+      dbgPrint(">> Note Received: ");
+      dbgPrintln(noteContent);
+    } else {
+      dbgPrintln(">> No note or timeout reading note");
     }
 
-    // ---------------------------------------------------------------
-    // 3. Formatted print statement with a 5s delay
-    // ---------------------------------------------------------------
-    if (currentMillis - previousPrintMillis >= 5000) {
-        previousPrintMillis = currentMillis;
-        
-        int rawA1 = analogRead(ANALOG_INPUT_PIN);
-        DEBUG_PRINT("Raw A1: ");
-        DEBUG_PRINTLN(rawA1);
+    dbgPrintln("Re-arming Notecard ATTN...");
+    armNotecardAttn();
+  }
 
-        DEBUG_PRINTLN("Sending ADC value to Android");
-        androidSerial.print("ADC value:");
-        androidSerial.print(rawA1);
-
-        // Send ADC value to Notehub via Notecard
-        char addNoteCmd[200];
-        snprintf(addNoteCmd, sizeof(addNoteCmd), "{\"req\":\"note.add\",\"file\":\"data.qi\",\"body\":{\"adc\":%d}}", rawA1);
-        notecardSerial.println(addNoteCmd);
-        DEBUG_PRINTLN("ADC value sent to Notehub");
+  // 2) Optional: read inbound bytes from HM-10 UART (useful for debugging AT mode).
+  if (bleUart.available()) {
+    char line[128];
+    size_t bytesRead = 0;
+    
+    while (bleUart.available() && bytesRead < sizeof(line) - 1) {
+      char c = bleUart.read();
+      if (c == '\n') break;
+      if (c != '\r') {
+        line[bytesRead++] = c;
+      }
     }
+    line[bytesRead] = '\0';
+    
+    if (bytesRead > 0) {
+      dbgPrint(">> HM-10 UART: ");
+      dbgPrintln(line);
+    }
+  }
+
+  // 3) Periodic ADC sample -> send to USB (wired) + HM-10 (wireless) + Notecard (cloud).
+  if (nowMs - lastSampleMs >= kSamplePeriodMs) {
+    lastSampleMs = nowMs;
+
+    const int adc = readAveragedAdc();
+    dbgPrint("Raw ADC (averaged): ");
+    dbgPrintln(adc);
+
+    // Wired to Android via USB serial
+    Serial.print("ADC value:");
+    Serial.print(adc);
+    Serial.print("\r\n");
+
+    // Wireless to Android via HM-10 (transparent UART over BLE)
+    bleUart.print("ADC value:");
+    bleUart.print(adc);
+    bleUart.print("\r\n");
+
+    // Cloud via Notecard
+    char addNoteCmd[200];
+    snprintf(addNoteCmd, sizeof(addNoteCmd),
+             "{\"req\":\"note.add\",\"file\":\"data.qi\",\"body\":{\"adc\":%d}}",
+             adc);
+    notecardUart.println(addNoteCmd);
+    
+    char response[256];
+    if (readNotecardResponse(response, sizeof(response), 1000)) {
+      if (isValidNotecardResponse(response)) {
+        dbgPrintln("ADC value sent to Notehub");
+      } else {
+        dbgPrint("Warning: Note add response: ");
+        dbgPrintln(response);
+      }
+    }
+  }
 }
