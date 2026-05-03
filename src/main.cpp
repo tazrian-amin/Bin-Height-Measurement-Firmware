@@ -16,6 +16,10 @@
         F_RX -> N_TX
         F_D5 -> N_ATTN   (ATTN interrupt)
 
+  Notefiles (Important):
+    - `*.qi` = inbound (Notehub/device app -> firmware). Use `note.get` here, NOT `note.add`.
+    - `*.qo` = outbound (firmware -> Notehub). Use `note.add` here for sensor telemetry.
+
   HM-10 BLE UART (wireless to Android):
     - Code name: `bleUart` (UART on pins A0/A3)
     - Notecarrier-F silkscreen pins:
@@ -27,6 +31,20 @@
   Important:
     - Do NOT connect a USB-Serial adapter to F_A0/F_A3 at the same time as the HM-10.
       Wired mode should use the Swan micro-USB (`Serial`), while wireless uses HM-10 (`bleUart`).
+
+  ==================
+  Naming conventions
+  ==================
+
+  - `kSomething`: a compile-time constant (the "k" prefix is a common C++ convention for constants).
+    Example: `kSamplePeriodMs` is the fixed interval between samples.
+
+  - Units are part of names when it helps avoid mistakes:
+      `Ms` = milliseconds, so `kSamplePeriodMs` is measured in milliseconds.
+
+  - `lastSomethingMs`: a runtime variable that stores the last time an event happened (in ms from `millis()`).
+    Example: `lastSampleMs` is updated each time we take/send a sample, so we can send again after
+    `kSamplePeriodMs` elapses without blocking the loop.
 */
 
 namespace {
@@ -56,10 +74,29 @@ inline void dbgPrintln() {
   }
 }
 
+// ----------------------------
+// Notecard wiring (Notecarrier-F)
+// ----------------------------
+// - `F_TX` -> `N_RX` and `F_RX` -> `N_TX`  (this is `Serial1`)
+// - `F_D5` -> `N_ATTN` (attention interrupt)
 HardwareSerial& notecardUart = Serial1;
-constexpr uint8_t kNotecardAttnPin = D5; // F_D5 -> N_ATTN (attention interrupt)
-constexpr uint8_t kBleUartRxPin = A0; // HM-10 TXD -> F_A0 (MCU RX)
-constexpr uint8_t kBleUartTxPin = A3; // HM-10 RXD -> F_A3 (MCU TX)
+constexpr uint8_t kNotecardAttnPin = D5;
+
+// ----------------------------
+// Android outputs (choose wired or wireless)
+// ----------------------------
+// WIRED (USB): Swan micro-USB -> `Serial`
+// WIRELESS (BLE HM-10): UART on Notecarrier-F `F_A0`/`F_A3`
+//
+// HM-10 connections:
+// - HM-10 TXD -> F_A0 (MCU RX)
+// - HM-10 RXD -> F_A3 (MCU TX)
+// - HM-10 VCC -> 3V3
+// - HM-10 GND -> GND
+//
+// Note: A USB-Serial adapter connected to F_A0/F_A3 conflicts with the HM-10.
+constexpr uint8_t kBleUartRxPin = A0; // MCU RX  <- HM-10 TXD
+constexpr uint8_t kBleUartTxPin = A3; // MCU TX  -> HM-10 RXD
 HardwareSerial bleUart(kBleUartRxPin, kBleUartTxPin);
 
 // ----------------------------
@@ -71,67 +108,24 @@ constexpr uint8_t kAdcPin = PA1;
 // Notecard config
 // ----------------------------
 constexpr const char* kProductUid = "com.gmail.amin.tazrian1979:binheightv2";
+/** Inbound: commands from Notehub (card.attn + note.get). */
 constexpr const char* kInboundNotefile = "data.qi";
+/** Outbound: telemetry to Notehub (note.add). Must be `.qo`, not `.qi`. */
+constexpr const char* kOutboundNotefile = "height.qo";
 
 // ----------------------------
 // Timing
 // ----------------------------
-constexpr unsigned long kSamplePeriodMs = 5000; // 5 seconds between ADC samples
-const unsigned long kSyncTimeoutMs = 5000; // 5 seconds max to wait for Notecard sync response after ATTN
-const unsigned long kNotecardResponseTimeoutMs = 5000; // 5 seconds max to wait for any Notecard response (e.g., product config, note add, etc.)
-const unsigned long kAdcAverageSamples = 10; // Number of ADC samples to average for each reported value
-
-unsigned long lastSampleMs = 0; // Timestamp of last ADC sample sent
-unsigned long syncStartMs = 0; // Timestamp when Notecard sync was initiated (after ATTN)
-bool isSyncing = false; // True if we're currently waiting for Notecard sync response after ATTN interrupt
-bool attnTriggered = false; // Set to true in ATTN interrupt handler, indicating we should poll for note in main loop
-
-void onAttnInterrupt() {
-  attnTriggered = true;
-}
-
-bool readNotecardResponse(char* buffer, size_t bufferSize, unsigned long timeoutMs) {
-  unsigned long startTime = millis();
-  size_t bytesRead = 0;
-  
-  while (millis() - startTime < timeoutMs) {
-    if (notecardUart.available()) {
-      char c = notecardUart.read();
-      if (bytesRead < bufferSize - 1) {
-        buffer[bytesRead++] = c;
-      }
-      if (c == '\n') {
-        buffer[bytesRead] = '\0';
-        return true;
-      }
-    }
-  }
-  buffer[bytesRead] = '\0';
-  return false;
-}
-
-bool isValidNotecardResponse(const char* response) {
-  return response != nullptr && strlen(response) > 2 && strstr(response, "err") == nullptr;
-}
+constexpr unsigned long kSamplePeriodMs = 5000;
+unsigned long lastSampleMs = 0;
 
 void armNotecardAttn() {
-  notecardUart.println("{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"data.qi\"]}" );
-  char response[256];
-  readNotecardResponse(response, sizeof(response), 1000);
-  if (isValidNotecardResponse(response)) {
-    dbgPrintln("Notecard ATTN armed successfully");
-  } else {
-    dbgPrint("Warning: ATTN arm response: ");
-    dbgPrintln(response);
-  }
-}
-
-int readAveragedAdc() {
-  long sum = 0;
-  for (uint16_t i = 0; i < kAdcAverageSamples; i++) {
-    sum += analogRead(kAdcPin);
-  }
-  return (int)(sum / kAdcAverageSamples);
+  char attnCmd[200];
+  snprintf(attnCmd, sizeof(attnCmd),
+           "{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"%s\"]}",
+           kInboundNotefile);
+  notecardUart.println(attnCmd);
+  notecardUart.readStringUntil('\n'); // clear response
 }
 
 } // namespace
@@ -150,51 +144,23 @@ void setup() {
   pinMode(kAdcPin, INPUT_ANALOG);
   analogReadResolution(12);
   pinMode(kNotecardAttnPin, INPUT);
-  attachInterrupt(digitalPinToInterrupt(kNotecardAttnPin), onAttnInterrupt, RISING);
 
   delay(3000);
 
   // Configure Notecard
-  char productCmd[256];
-  snprintf(productCmd, sizeof(productCmd), "{\"req\":\"hub.set\",\"product\":\"%s\"}", kProductUid);
-  notecardUart.println(productCmd);
-  
-  char response[256];
-  if (readNotecardResponse(response, sizeof(response), kNotecardResponseTimeoutMs)) {
-    if (isValidNotecardResponse(response)) {
-      dbgPrint("Notecard product set: ");
-      dbgPrintln(response);
-    } else {
-      dbgPrint("Warning: Product config response: ");
-      dbgPrintln(response);
-    }
-  } else {
-    dbgPrintln("Error: Notecard product config timeout");
-  }
-  
+  notecardUart.println((String("{\"req\":\"hub.set\",\"product\":\"") + kProductUid + "\"}").c_str());
   delay(1000);
-  
   notecardUart.println("{\"req\":\"hub.set\",\"mode\":\"continuous\",\"sync\":true}");
-  if (readNotecardResponse(response, sizeof(response), kNotecardResponseTimeoutMs)) {
-    if (isValidNotecardResponse(response)) {
-      dbgPrint("Notecard mode set: ");
-      dbgPrintln(response);
-    } else {
-      dbgPrint("Warning: Mode config response: ");
-      dbgPrintln(response);
-    }
-  } else {
-    dbgPrintln("Error: Notecard mode config timeout");
-  }
+  delay(3000);
 
   dbgPrint("Notecard configured for ProductUID: ");
   dbgPrintln(kProductUid);
-  delay(2000);
+  delay(5000);
 
   armNotecardAttn();
 
   dbgPrintln("===Starting main loop===");
-  delay(2000);
+  delay(3000);
 }
 
 // ===================================================================
@@ -203,24 +169,16 @@ void setup() {
 void loop() {
   const unsigned long nowMs = millis();
 
-  // 1) Handle inbound Notecard note notifications (ATTN interrupt triggered).
-  if (attnTriggered && !isSyncing) {
-    attnTriggered = false;
-    isSyncing = true;
-    syncStartMs = nowMs;
-    
+  // 1) Handle inbound Notecard note notifications (ATTN pin goes HIGH).
+  if (digitalRead(kNotecardAttnPin) == HIGH) {
     dbgPrintln();
     dbgPrintln("-- Notecard ATTN HIGH: polling inbound note --");
 
-    // Initiate sync (non-blocking)
+    // Sync, then fetch and delete one note from kInboundNotefile.
     notecardUart.println("{\"req\":\"hub.sync\"}");
-  }
+    notecardUart.readStringUntil('\n'); // clear immediate {}
+    delay(5000);
 
-  // Handle sync completion with timeout
-  if (isSyncing && (nowMs - syncStartMs >= kSyncTimeoutMs)) {
-    isSyncing = false;
-    
-    // Clear any remaining data
     while (notecardUart.available()) {
       notecardUart.read();
     }
@@ -231,33 +189,20 @@ void loop() {
              kInboundNotefile);
     notecardUart.println(getNoteCmd);
 
-    char noteContent[512];
-    if (readNotecardResponse(noteContent, sizeof(noteContent), 2000)) {
-      dbgPrint(">> Note Received: ");
-      dbgPrintln(noteContent);
-    } else {
-      dbgPrintln(">> No note or timeout reading note");
-    }
+    const String noteContent = notecardUart.readStringUntil('\n');
+    dbgPrint(">> Note Received: ");
+    dbgPrintln(noteContent);
 
     dbgPrintln("Re-arming Notecard ATTN...");
     armNotecardAttn();
+    delay(3000);
   }
 
   // 2) Optional: read inbound bytes from HM-10 UART (useful for debugging AT mode).
   if (bleUart.available()) {
-    char line[128];
-    size_t bytesRead = 0;
-    
-    while (bleUart.available() && bytesRead < sizeof(line) - 1) {
-      char c = bleUart.read();
-      if (c == '\n') break;
-      if (c != '\r') {
-        line[bytesRead++] = c;
-      }
-    }
-    line[bytesRead] = '\0';
-    
-    if (bytesRead > 0) {
+    String line = bleUart.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
       dbgPrint(">> HM-10 UART: ");
       dbgPrintln(line);
     }
@@ -267,8 +212,8 @@ void loop() {
   if (nowMs - lastSampleMs >= kSamplePeriodMs) {
     lastSampleMs = nowMs;
 
-    const int adc = readAveragedAdc();
-    dbgPrint("Raw ADC (averaged): ");
+    const int adc = analogRead(kAdcPin);
+    dbgPrint("Raw ADC: ");
     dbgPrintln(adc);
 
     // Wired to Android via USB serial
@@ -281,21 +226,16 @@ void loop() {
     bleUart.print(adc);
     bleUart.print("\r\n");
 
-    // Cloud via Notecard
-    char addNoteCmd[200];
+    // Cloud via Notecard (outbound queue only — see kOutboundNotefile)
+    char addNoteCmd[220];
     snprintf(addNoteCmd, sizeof(addNoteCmd),
-             "{\"req\":\"note.add\",\"file\":\"data.qi\",\"body\":{\"adc\":%d}}",
-             adc);
+             "{\"req\":\"note.add\",\"file\":\"%s\",\"body\":{\"adc\":%d}}",
+             kOutboundNotefile, adc);
     notecardUart.println(addNoteCmd);
-    
-    char response[256];
-    if (readNotecardResponse(response, sizeof(response), 1000)) {
-      if (isValidNotecardResponse(response)) {
-        dbgPrintln("ADC value sent to Notehub");
-      } else {
-        dbgPrint("Warning: Note add response: ");
-        dbgPrintln(response);
-      }
+    const String addResp = notecardUart.readStringUntil('\n');
+    if (addResp.indexOf("\"err\"") >= 0) {
+      dbgPrint("Warning: Note add response: ");
+      dbgPrintln(addResp);
     }
   }
 }
