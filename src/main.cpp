@@ -150,7 +150,7 @@ char gSerialNumber[kMaxSerialNumLength + 1] = {0};
 // ----------------------------
 // Timing
 // ----------------------------
-constexpr unsigned long kSamplePeriodMs = 1800000;  // 30 minutes in milliseconds
+constexpr unsigned long kSamplePeriodMs = 300000;  // 5 minutes in milliseconds
 unsigned long lastSampleMs = 0;
 
 void armNotecardAttn() {
@@ -722,8 +722,8 @@ void loop() {
     // Cloud via Notecard (outbound queue only — see kOutboundNotefile)
     char addNoteCmd[220];
     snprintf(addNoteCmd, sizeof(addNoteCmd),
-             "{\"req\":\"note.add\",\"file\":\"%s\",\"body\":{\"adc\":%d}}",
-             kOutboundNotefile, adc);
+         "{\"req\":\"note.add\",\"file\":\"%s\",\"sync\":true,\"body\":{\"adc\":%d}}",
+         kOutboundNotefile, adc);
     notecardUart.println(addNoteCmd);
     const String addResp = notecardUart.readStringUntil('\n');
     if (addResp.indexOf("\"err\"") >= 0) {
